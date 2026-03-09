@@ -16,35 +16,24 @@
 
   <author email="zhangji@cmu.edu">Ji Zhang</author>
 
-  <buildtool_depend>catkin</buildtool_depend>
-  <build_depend>geometry_msgs</build_depend>
-  <build_depend>nav_msgs</build_depend>
-  <build_depend>roscpp</build_depend>
-  <build_depend>rospy</build_depend>
-  <build_depend>std_msgs</build_depend>
-  <build_depend>sensor_msgs</build_depend>
-  <build_depend>tf</build_depend>
-  <build_depend>pcl_ros</build_depend>
-  <build_depend>livox_ros_driver2</build_depend>
-  <build_depend>message_generation</build_depend>
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <build_depend>rosidl_default_generators</build_depend>
 
-  <exec_depend>geometry_msgs</exec_depend>
-  <exec_depend>nav_msgs</exec_depend>
-  <exec_depend>sensor_msgs</exec_depend>
-  <exec_depend>roscpp</exec_depend>
-  <exec_depend>rospy</exec_depend>
-  <exec_depend>ros_numpy</exec_depend>
-  <exec_depend>std_msgs</exec_depend>
-  <exec_depend>tf</exec_depend>
-  <exec_depend>pcl_ros</exec_depend>
-  <exec_depend>livox_ros_driver2</exec_depend>
-  <exec_depend>message_runtime</exec_depend>
-  <exec_depend condition="$ROS_PYTHON_VERSION == 2">python-open3d-pip</exec_depend>
-  <exec_depend condition="$ROS_PYTHON_VERSION == 3">python3-open3d-pip</exec_depend>
+  <depend>geometry_msgs</depend>
+  <depend>nav_msgs</depend>
+  <depend>rclcpp</depend>
+  <depend>sensor_msgs</depend>
+  <depend>std_msgs</depend>
+  <depend>visualization_msgs</depend>
+  <depend>tf2</depend>
+  <depend>tf2_ros</depend>
+  <depend>pcl_conversions</depend>
+  <depend>livox_ros_driver2</depend>
 
-  <test_depend>rostest</test_depend>
-  <test_depend>rosbag</test_depend>
+  <exec_depend>rosidl_default_runtime</exec_depend>
 
   <export>
+    <build_type>ament_cmake</build_type>
+    <member_of_group>rosidl_interface_packages</member_of_group>
   </export>
 </package>

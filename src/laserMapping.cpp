@@ -41,22 +41,17 @@
 #include <unistd.h>
 #include <Python.h>
 #include <so3_math.h>
-#include <ros/ros.h>
 #include <Eigen/Core>
+#include <fastlio_ros2_compat.hpp>
 #include "IMU_Processing.hpp"
-#include <nav_msgs/Odometry.h>
-#include <nav_msgs/Path.h>
-#include <visualization_msgs/Marker.h>
 #include <pcl_conversions/pcl_conversions.h>
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
 #include <pcl/filters/voxel_grid.h>
 #include <pcl/io/pcd_io.h>
-#include <sensor_msgs/PointCloud2.h>
-#include <tf/transform_datatypes.h>
-#include <tf/transform_broadcaster.h>
-#include <geometry_msgs/Vector3.h>
-#include <livox_ros_driver2/CustomMsg.h>
+#include <tf2/LinearMath/Quaternion.h>
+#include <tf2_ros/transform_broadcaster.h>
+#include <geometry_msgs/msg/transform_stamped.hpp>
 #include "preprocess.h"
 #include <ikd-Tree/ikd_Tree.h>
 
@@ -104,7 +99,7 @@ vector<double>       extrinT(3, 0.0);
 vector<double>       extrinR(9, 0.0);
 deque<double>                     time_buffer;
 deque<PointCloudXYZI::Ptr>        lidar_buffer;
-deque<sensor_msgs::Imu::ConstPtr> imu_buffer;
+deque<sensor_msgs::ImuConstPtr> imu_buffer;
 
 PointCloudXYZI::Ptr featsFromMap(new PointCloudXYZI());
 PointCloudXYZI::Ptr feats_undistort(new PointCloudXYZI());
@@ -142,7 +137,37 @@ geometry_msgs::PoseStamped msg_body_pose;
 shared_ptr<Preprocess> p_pre(new Preprocess());
 shared_ptr<ImuProcess> p_imu(new ImuProcess());
 
-ros::Publisher pubPrecedeOdom;
+template<typename MsgT>
+using PublisherPtr = typename rclcpp::Publisher<MsgT>::SharedPtr;
+
+std::shared_ptr<rclcpp::Node> fastlio_node;
+std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster;
+PublisherPtr<nav_msgs::Odometry> pubPrecedeOdom;
+
+template<typename T>
+void declare_and_get_parameter(const std::shared_ptr<rclcpp::Node> &node, const std::string &name,
+                               T &value, const T &default_value)
+{
+    if (!node->has_parameter(name)) {
+        node->declare_parameter<T>(name, default_value);
+    }
+    node->get_parameter(name, value);
+}
+
+double stamp_to_sec(const builtin_interfaces::msg::Time &stamp)
+{
+    return rclcpp::Time(stamp).seconds();
+}
+
+builtin_interfaces::msg::Time sec_to_stamp(const double seconds)
+{
+    return rclcpp::Time(static_cast<int64_t>(seconds * 1e9)).to_msg();
+}
+
+double now_sec()
+{
+    return fastlio_node ? fastlio_node->get_clock()->now().seconds() : 0.0;
+}
 
 void SigHandle(int sig)
 {
@@ -280,12 +305,12 @@ void lasermap_fov_segment()
     kdtree_delete_time = omp_get_wtime() - delete_begin;
 }
 
-void standard_pcl_cbk(const sensor_msgs::PointCloud2::ConstPtr &msg) 
+void standard_pcl_cbk(const sensor_msgs::PointCloud2::ConstSharedPtr &msg) 
 {
     mtx_buffer.lock();
     scan_count ++;
     double preprocess_start_time = omp_get_wtime();
-    if (msg->header.stamp.toSec() < last_timestamp_lidar)
+    if (stamp_to_sec(msg->header.stamp) < last_timestamp_lidar)
     {
         ROS_ERROR("lidar loop back, clear buffer");
         lidar_buffer.clear();
@@ -294,8 +319,8 @@ void standard_pcl_cbk(const sensor_msgs::PointCloud2::ConstPtr &msg)
     PointCloudXYZI::Ptr  ptr(new PointCloudXYZI());
     p_pre->process(msg, ptr);
     lidar_buffer.push_back(ptr);
-    time_buffer.push_back(msg->header.stamp.toSec());
-    last_timestamp_lidar = msg->header.stamp.toSec();
+    time_buffer.push_back(stamp_to_sec(msg->header.stamp));
+    last_timestamp_lidar = stamp_to_sec(msg->header.stamp);
     s_plot11[scan_count] = omp_get_wtime() - preprocess_start_time;
     mtx_buffer.unlock();
     sig_buffer.notify_all();
@@ -303,18 +328,18 @@ void standard_pcl_cbk(const sensor_msgs::PointCloud2::ConstPtr &msg)
 
 double timediff_lidar_wrt_imu = 0.0;
 bool   timediff_set_flg = false;
-void livox_pcl_cbk(const livox_ros_driver2::CustomMsg::ConstPtr &msg) 
+void livox_pcl_cbk(const livox_ros_driver2::CustomMsg::ConstSharedPtr &msg) 
 {
     mtx_buffer.lock();
     double preprocess_start_time = omp_get_wtime();
     scan_count ++;
     //ROS_INFO("LiDAR got at: %f",msg->header.stamp.toSec());
-    if (msg->header.stamp.toSec() < last_timestamp_lidar)
+    if (stamp_to_sec(msg->header.stamp) < last_timestamp_lidar)
     {
         ROS_ERROR("lidar loop back, clear buffer");
         lidar_buffer.clear();
     }
-    last_timestamp_lidar = msg->header.stamp.toSec();
+    last_timestamp_lidar = stamp_to_sec(msg->header.stamp);
     
     if (!time_sync_en && abs(last_timestamp_imu - last_timestamp_lidar) > 10.0 && !imu_buffer.empty() && !lidar_buffer.empty() )
     {
@@ -338,23 +363,22 @@ void livox_pcl_cbk(const livox_ros_driver2::CustomMsg::ConstPtr &msg)
     sig_buffer.notify_all();
 }
 
-void imu_cbk(const sensor_msgs::Imu::ConstPtr &msg_in) 
+void imu_cbk(const sensor_msgs::Imu::ConstSharedPtr &msg_in) 
 {
     publish_count ++;
     //ROS_INFO("IMU got at: %f",msg_in->header.stamp.toSec());
-    sensor_msgs::Imu::Ptr msg(new sensor_msgs::Imu(*msg_in));
+    sensor_msgs::Imu::SharedPtr msg = std::make_shared<sensor_msgs::Imu>(*msg_in);
 
-    msg->header.stamp = ros::Time().fromSec(msg_in->header.stamp.toSec() - time_diff_lidar_to_imu);
+    msg->header.stamp = sec_to_stamp(stamp_to_sec(msg_in->header.stamp) - time_diff_lidar_to_imu);
     if (abs(timediff_lidar_wrt_imu) > 0.1 && time_sync_en)
     {
-        msg->header.stamp = \
-        ros::Time().fromSec(timediff_lidar_wrt_imu + msg_in->header.stamp.toSec());
+        msg->header.stamp = sec_to_stamp(timediff_lidar_wrt_imu + stamp_to_sec(msg_in->header.stamp));
     }
 
     // ROS_INFO("time_diff_lidar_to_imu: %f, timediff_lidar_wrt_imu: %f",
     //          time_diff_lidar_to_imu, timediff_lidar_wrt_imu);
 
-    double timestamp = msg->header.stamp.toSec();
+    double timestamp = stamp_to_sec(msg->header.stamp);
 
     mtx_buffer.lock();
 
@@ -371,7 +395,7 @@ void imu_cbk(const sensor_msgs::Imu::ConstPtr &msg_in)
       }
     else
       {
-        sensor_msgs::Imu::ConstPtr init_imu(new sensor_msgs::Imu());
+                sensor_msgs::ImuConstPtr init_imu = std::make_shared<sensor_msgs::Imu>();
         p_imu->OnlyPredict(msg, init_imu, kf_pre);
       }
 
@@ -396,7 +420,7 @@ void imu_cbk(const sensor_msgs::Imu::ConstPtr &msg_in)
         odom_msg.twist.twist.angular.x = msg->angular_velocity.x - kf_pre_state.bg(0);
         odom_msg.twist.twist.angular.y = msg->angular_velocity.y - kf_pre_state.bg(1);
         odom_msg.twist.twist.angular.z = msg->angular_velocity.z - kf_pre_state.bg(2);
-        pubPrecedeOdom.publish(odom_msg);
+                pubPrecedeOdom->publish(odom_msg);
       }
 
 
@@ -446,11 +470,11 @@ bool sync_packages(MeasureGroup &meas)
     }
 
     /*** push imu data, and pop from imu buffer ***/
-    double imu_time = imu_buffer.front()->header.stamp.toSec();
+    double imu_time = stamp_to_sec(imu_buffer.front()->header.stamp);
     meas.imu.clear();
     while ((!imu_buffer.empty()) && (imu_time < lidar_end_time))
     {
-        imu_time = imu_buffer.front()->header.stamp.toSec();
+        imu_time = stamp_to_sec(imu_buffer.front()->header.stamp);
         if(imu_time > lidar_end_time) break;
         meas.imu.push_back(imu_buffer.front());
         imu_buffer.pop_front();
@@ -520,12 +544,12 @@ void map_incremental()
 
 PointCloudXYZI::Ptr pcl_wait_pub(new PointCloudXYZI(500000, 1));
 PointCloudXYZI::Ptr pcl_wait_save(new PointCloudXYZI());
-void publish_frame_world(const ros::Publisher & pubLaserCloudFull)
+void publish_frame_world(const PublisherPtr<sensor_msgs::PointCloud2> & pubLaserCloudFull)
 {
 
   if (scan_pub_rate > 0)
     {
-      double curr_t = ros::Time::now().toSec();
+            double curr_t = now_sec();
 
       if (curr_t - scan_pub_t < 1 / scan_pub_rate) return;
 
@@ -545,9 +569,9 @@ void publish_frame_world(const ros::Publisher & pubLaserCloudFull)
 
   sensor_msgs::PointCloud2 laserCloudmsg;
   pcl::toROSMsg(*laserCloudWorld, laserCloudmsg);
-  laserCloudmsg.header.stamp = ros::Time().fromSec(lidar_end_time);
+    laserCloudmsg.header.stamp = sec_to_stamp(lidar_end_time);
   laserCloudmsg.header.frame_id = "camera_init";
-  pubLaserCloudFull.publish(laserCloudmsg);
+    pubLaserCloudFull->publish(laserCloudmsg);
   publish_count -= PUBFRAME_PERIOD;
 }
 
@@ -584,7 +608,7 @@ void save_pcd()
     }
 }
 
-void publish_frame_body(const ros::Publisher & pubLaserCloudFull_body)
+void publish_frame_body(const PublisherPtr<sensor_msgs::PointCloud2> & pubLaserCloudFull_body)
 {
     int size = feats_undistort->points.size();
     PointCloudXYZI::Ptr laserCloudIMUBody(new PointCloudXYZI(size, 1));
@@ -597,13 +621,13 @@ void publish_frame_body(const ros::Publisher & pubLaserCloudFull_body)
 
     sensor_msgs::PointCloud2 laserCloudmsg;
     pcl::toROSMsg(*laserCloudIMUBody, laserCloudmsg);
-    laserCloudmsg.header.stamp = ros::Time().fromSec(lidar_end_time);
+    laserCloudmsg.header.stamp = sec_to_stamp(lidar_end_time);
     laserCloudmsg.header.frame_id = "body";
-    pubLaserCloudFull_body.publish(laserCloudmsg);
+    pubLaserCloudFull_body->publish(laserCloudmsg);
     publish_count -= PUBFRAME_PERIOD;
 }
 
-void publish_effect_world(const ros::Publisher & pubLaserCloudEffect)
+void publish_effect_world(const PublisherPtr<sensor_msgs::PointCloud2> & pubLaserCloudEffect)
 {
     PointCloudXYZI::Ptr laserCloudWorld( \
                     new PointCloudXYZI(effct_feat_num, 1));
@@ -614,18 +638,18 @@ void publish_effect_world(const ros::Publisher & pubLaserCloudEffect)
     }
     sensor_msgs::PointCloud2 laserCloudFullRes3;
     pcl::toROSMsg(*laserCloudWorld, laserCloudFullRes3);
-    laserCloudFullRes3.header.stamp = ros::Time().fromSec(lidar_end_time);
+    laserCloudFullRes3.header.stamp = sec_to_stamp(lidar_end_time);
     laserCloudFullRes3.header.frame_id = "camera_init";
-    pubLaserCloudEffect.publish(laserCloudFullRes3);
+    pubLaserCloudEffect->publish(laserCloudFullRes3);
 }
 
-void publish_map(const ros::Publisher & pubLaserCloudMap)
+void publish_map(const PublisherPtr<sensor_msgs::PointCloud2> & pubLaserCloudMap)
 {
     sensor_msgs::PointCloud2 laserCloudMap;
     pcl::toROSMsg(*featsFromMap, laserCloudMap);
-    laserCloudMap.header.stamp = ros::Time().fromSec(lidar_end_time);
+    laserCloudMap.header.stamp = sec_to_stamp(lidar_end_time);
     laserCloudMap.header.frame_id = "camera_init";
-    pubLaserCloudMap.publish(laserCloudMap);
+    pubLaserCloudMap->publish(laserCloudMap);
 }
 
 template<typename T>
@@ -641,13 +665,12 @@ void set_posestamp(T & out)
     
 }
 
-void publish_odometry(const ros::Publisher & pubOdomAftMapped)
+void publish_odometry(const PublisherPtr<nav_msgs::Odometry> & pubOdomAftMapped)
 {
     odomAftMapped.header.frame_id = "camera_init";
     odomAftMapped.child_frame_id = "body";
-    odomAftMapped.header.stamp = ros::Time().fromSec(lidar_end_time);// ros::Time().fromSec(lidar_end_time);
+    odomAftMapped.header.stamp = sec_to_stamp(lidar_end_time);
     set_posestamp(odomAftMapped.pose);
-    pubOdomAftMapped.publish(odomAftMapped);
     auto P = kf.get_P();
     for (int i = 0; i < 6; i ++)
     {
@@ -659,25 +682,31 @@ void publish_odometry(const ros::Publisher & pubOdomAftMapped)
         odomAftMapped.pose.covariance[i*6 + 4] = P(k, 1);
         odomAftMapped.pose.covariance[i*6 + 5] = P(k, 2);
     }
+    pubOdomAftMapped->publish(odomAftMapped);
 
-    static tf::TransformBroadcaster br;
-    tf::Transform                   transform;
-    tf::Quaternion                  q;
-    transform.setOrigin(tf::Vector3(odomAftMapped.pose.pose.position.x, \
-                                    odomAftMapped.pose.pose.position.y, \
-                                    odomAftMapped.pose.pose.position.z));
+    geometry_msgs::msg::TransformStamped transform;
+    tf2::Quaternion q;
+    transform.header.stamp = odomAftMapped.header.stamp;
+    transform.header.frame_id = "camera_init";
+    transform.child_frame_id = "body";
+    transform.transform.translation.x = odomAftMapped.pose.pose.position.x;
+    transform.transform.translation.y = odomAftMapped.pose.pose.position.y;
+    transform.transform.translation.z = odomAftMapped.pose.pose.position.z;
     q.setW(odomAftMapped.pose.pose.orientation.w);
     q.setX(odomAftMapped.pose.pose.orientation.x);
     q.setY(odomAftMapped.pose.pose.orientation.y);
     q.setZ(odomAftMapped.pose.pose.orientation.z);
-    transform.setRotation( q );
-    br.sendTransform( tf::StampedTransform( transform, odomAftMapped.header.stamp, "camera_init", "body" ) );
+    transform.transform.rotation.x = q.x();
+    transform.transform.rotation.y = q.y();
+    transform.transform.rotation.z = q.z();
+    transform.transform.rotation.w = q.w();
+    tf_broadcaster->sendTransform(transform);
 }
 
-void publish_path(const ros::Publisher pubPath)
+void publish_path(const PublisherPtr<nav_msgs::Path> & pubPath)
 {
     set_posestamp(msg_body_pose);
-    msg_body_pose.header.stamp = ros::Time().fromSec(lidar_end_time);
+    msg_body_pose.header.stamp = sec_to_stamp(lidar_end_time);
     msg_body_pose.header.frame_id = "camera_init";
 
     /*** if path is too large, the rvis will crash ***/
@@ -686,7 +715,7 @@ void publish_path(const ros::Publisher pubPath)
     if (jjj % 10 == 0) 
     {
         path.poses.push_back(msg_body_pose);
-        pubPath.publish(path);
+        pubPath->publish(path);
     }
 }
 
@@ -810,46 +839,49 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
 
 int main(int argc, char** argv)
 {
-    ros::init(argc, argv, "laserMapping");
-    ros::NodeHandle nh;
+    rclcpp::init(argc, argv);
+    rclcpp::NodeOptions options;
+    options.automatically_declare_parameters_from_overrides(true);
+    fastlio_node = std::make_shared<rclcpp::Node>("laserMapping", options);
+    tf_broadcaster = std::make_unique<tf2_ros::TransformBroadcaster>(fastlio_node);
 
-    nh.param<bool>("publish/path_en",path_en, true);
-    nh.param<bool>("publish/scan_publish_en",scan_pub_en, true);
-    nh.param<bool>("publish/dense_publish_en",dense_pub_en, true);
-    nh.param<bool>("publish/scan_bodyframe_pub_en",scan_body_pub_en, true);
-    nh.param<double>("publish/scan_publish_rate",scan_pub_rate, 0.0);
-    nh.param<int>("max_iteration",NUM_MAX_ITERATIONS,4);
-    nh.param<string>("map_file_path",map_file_path,"");
-    nh.param<string>("common/lid_topic",lid_topic,"livox/lidar");
-    nh.param<string>("common/imu_topic", imu_topic,"livox/imu");
-    nh.param<bool>("common/time_sync_en", time_sync_en, false);
-    nh.param<double>("common/time_offset_lidar_to_imu", time_diff_lidar_to_imu, 0.0);
-    nh.param<double>("filter_size_corner",filter_size_corner_min,0.5);
-    nh.param<double>("filter_size_surf",filter_size_surf_min,0.5);
-    nh.param<double>("filter_size_map",filter_size_map_min,0.5);
-    nh.param<double>("cube_side_length",cube_len,200);
-    nh.param<float>("mapping/det_range",DET_RANGE,300.f);
-    nh.param<double>("mapping/fov_degree",fov_deg,180);
-    nh.param<double>("mapping/gyr_cov",gyr_cov,0.1);
-    nh.param<double>("mapping/acc_cov",acc_cov,0.1);
-    nh.param<double>("mapping/b_gyr_cov",b_gyr_cov,0.0001);
-    nh.param<double>("mapping/b_acc_cov",b_acc_cov,0.0001);
-    nh.param<double>("preprocess/blind", p_pre->blind, 0.01);
-    nh.param<int>("preprocess/lidar_type", p_pre->lidar_type, AVIA);
-    nh.param<int>("preprocess/scan_line", p_pre->N_SCANS, 16);
-    nh.param<int>("preprocess/timestamp_unit", p_pre->time_unit, US);
-    nh.param<int>("preprocess/scan_rate", p_pre->SCAN_RATE, 10);
-    nh.param<int>("point_filter_num", p_pre->point_filter_num, 2);
-    nh.param<bool>("feature_extract_enable", p_pre->feature_enabled, false);
-    nh.param<bool>("runtime_pos_log_enable", runtime_pos_log, 0);
-    nh.param<bool>("mapping/extrinsic_est_en", extrinsic_est_en, true);
-    nh.param<bool>("pcd_save/pcd_save_en", pcd_save_en, false);
-    nh.param<int>("pcd_save/interval", pcd_save_interval, -1);
-    nh.param<vector<double>>("mapping/extrinsic_T", extrinT, vector<double>());
-    nh.param<vector<double>>("mapping/extrinsic_R", extrinR, vector<double>());
+    declare_and_get_parameter<bool>(fastlio_node, "publish.path_en", path_en, true);
+    declare_and_get_parameter<bool>(fastlio_node, "publish.scan_publish_en", scan_pub_en, true);
+    declare_and_get_parameter<bool>(fastlio_node, "publish.dense_publish_en", dense_pub_en, true);
+    declare_and_get_parameter<bool>(fastlio_node, "publish.scan_bodyframe_pub_en", scan_body_pub_en, true);
+    declare_and_get_parameter<double>(fastlio_node, "publish.scan_publish_rate", scan_pub_rate, 0.0);
+    declare_and_get_parameter<int>(fastlio_node, "max_iteration", NUM_MAX_ITERATIONS, 4);
+    declare_and_get_parameter<string>(fastlio_node, "map_file_path", map_file_path, "");
+    declare_and_get_parameter<string>(fastlio_node, "common.lid_topic", lid_topic, "livox/lidar");
+    declare_and_get_parameter<string>(fastlio_node, "common.imu_topic", imu_topic, "livox/imu");
+    declare_and_get_parameter<bool>(fastlio_node, "common.time_sync_en", time_sync_en, false);
+    declare_and_get_parameter<double>(fastlio_node, "common.time_offset_lidar_to_imu", time_diff_lidar_to_imu, 0.0);
+    declare_and_get_parameter<double>(fastlio_node, "filter_size_corner", filter_size_corner_min, 0.5);
+    declare_and_get_parameter<double>(fastlio_node, "filter_size_surf", filter_size_surf_min, 0.5);
+    declare_and_get_parameter<double>(fastlio_node, "filter_size_map", filter_size_map_min, 0.5);
+    declare_and_get_parameter<double>(fastlio_node, "cube_side_length", cube_len, 200.0);
+    declare_and_get_parameter<float>(fastlio_node, "mapping.det_range", DET_RANGE, 300.0f);
+    declare_and_get_parameter<double>(fastlio_node, "mapping.fov_degree", fov_deg, 180.0);
+    declare_and_get_parameter<double>(fastlio_node, "mapping.gyr_cov", gyr_cov, 0.1);
+    declare_and_get_parameter<double>(fastlio_node, "mapping.acc_cov", acc_cov, 0.1);
+    declare_and_get_parameter<double>(fastlio_node, "mapping.b_gyr_cov", b_gyr_cov, 0.0001);
+    declare_and_get_parameter<double>(fastlio_node, "mapping.b_acc_cov", b_acc_cov, 0.0001);
+    declare_and_get_parameter<double>(fastlio_node, "preprocess.blind", p_pre->blind, 0.01);
+    declare_and_get_parameter<int>(fastlio_node, "preprocess.lidar_type", p_pre->lidar_type, AVIA);
+    declare_and_get_parameter<int>(fastlio_node, "preprocess.scan_line", p_pre->N_SCANS, 16);
+    declare_and_get_parameter<int>(fastlio_node, "preprocess.timestamp_unit", p_pre->time_unit, US);
+    declare_and_get_parameter<int>(fastlio_node, "preprocess.scan_rate", p_pre->SCAN_RATE, 10);
+    declare_and_get_parameter<int>(fastlio_node, "point_filter_num", p_pre->point_filter_num, 2);
+    declare_and_get_parameter<bool>(fastlio_node, "feature_extract_enable", p_pre->feature_enabled, false);
+    declare_and_get_parameter<bool>(fastlio_node, "runtime_pos_log_enable", runtime_pos_log, false);
+    declare_and_get_parameter<bool>(fastlio_node, "mapping.extrinsic_est_en", extrinsic_est_en, true);
+    declare_and_get_parameter<bool>(fastlio_node, "pcd_save.pcd_save_en", pcd_save_en, false);
+    declare_and_get_parameter<int>(fastlio_node, "pcd_save.interval", pcd_save_interval, -1);
+    declare_and_get_parameter<vector<double>>(fastlio_node, "mapping.extrinsic_T", extrinT, vector<double>());
+    declare_and_get_parameter<vector<double>>(fastlio_node, "mapping.extrinsic_R", extrinR, vector<double>());
     cout<<"p_pre->lidar_type "<<p_pre->lidar_type<<endl;
     
-    path.header.stamp    = ros::Time::now();
+    path.header.stamp    = fastlio_node->now().to_msg();
     path.header.frame_id ="camera_init";
 
     /*** variables definition ***/
@@ -897,31 +929,27 @@ int main(int argc, char** argv)
         cout << "~~~~"<<ROOT_DIR<<" doesn't exist" << endl;
 
     /*** ROS subscribe initialization ***/
-    ros::Subscriber sub_pcl = p_pre->lidar_type == AVIA ? \
-        nh.subscribe(lid_topic, 200000, livox_pcl_cbk) : \
-        nh.subscribe(lid_topic, 200000, standard_pcl_cbk);
-    ros::Subscriber sub_imu = nh.subscribe(imu_topic, 200000, imu_cbk);
-    ros::Publisher pubLaserCloudFull = nh.advertise<sensor_msgs::PointCloud2>
-            ("cloud_registered", 100000);
-    ros::Publisher pubLaserCloudFull_body = nh.advertise<sensor_msgs::PointCloud2>
-            ("cloud_registered_body", 100000);
-    ros::Publisher pubLaserCloudEffect = nh.advertise<sensor_msgs::PointCloud2>
-            ("cloud_effected", 100000);
-    ros::Publisher pubLaserCloudMap = nh.advertise<sensor_msgs::PointCloud2>
-            ("Laser_map", 100000);
-    ros::Publisher pubOdomAftMapped = nh.advertise<nav_msgs::Odometry> 
-            ("Odometry", 100000);
-    ros::Publisher pubPath          = nh.advertise<nav_msgs::Path> 
-            ("path", 100000);
-    pubPrecedeOdom = nh.advertise<nav_msgs::Odometry>("Odometry_precede", 100000);
+        auto sensor_qos = rclcpp::QoS(rclcpp::KeepLast(200000)).best_effort();
+        auto pub_qos = rclcpp::QoS(rclcpp::KeepLast(1000));
+        auto sub_pcl = p_pre->lidar_type == AVIA ? \
+        fastlio_node->create_subscription<livox_ros_driver2::CustomMsg>(lid_topic, sensor_qos, livox_pcl_cbk) : \
+        fastlio_node->create_subscription<sensor_msgs::PointCloud2>(lid_topic, sensor_qos, standard_pcl_cbk);
+        auto sub_imu = fastlio_node->create_subscription<sensor_msgs::Imu>(imu_topic, sensor_qos, imu_cbk);
+        auto pubLaserCloudFull = fastlio_node->create_publisher<sensor_msgs::PointCloud2>("cloud_registered", pub_qos);
+        auto pubLaserCloudFull_body = fastlio_node->create_publisher<sensor_msgs::PointCloud2>("cloud_registered_body", pub_qos);
+        auto pubLaserCloudEffect = fastlio_node->create_publisher<sensor_msgs::PointCloud2>("cloud_effected", pub_qos);
+        auto pubLaserCloudMap = fastlio_node->create_publisher<sensor_msgs::PointCloud2>("Laser_map", pub_qos);
+        auto pubOdomAftMapped = fastlio_node->create_publisher<nav_msgs::Odometry>("Odometry", pub_qos);
+        auto pubPath = fastlio_node->create_publisher<nav_msgs::Path>("path", pub_qos);
+        pubPrecedeOdom = fastlio_node->create_publisher<nav_msgs::Odometry>("Odometry_precede", pub_qos);
 //------------------------------------------------------------------------------------------------------
     signal(SIGINT, SigHandle);
-    ros::Rate rate(5000);
-    bool status = ros::ok();
+        rclcpp::WallRate rate(5000.0);
+        bool status = rclcpp::ok();
     while (status)
     {
         if (flg_exit) break;
-        ros::spinOnce();
+        rclcpp::spin_some(fastlio_node);
         if(sync_packages(Measures)) 
         {
             if (flg_first_scan)
@@ -1093,7 +1121,7 @@ int main(int argc, char** argv)
             }
         }
 
-        status = ros::ok();
+        status = rclcpp::ok();
         rate.sleep();
     }
 
