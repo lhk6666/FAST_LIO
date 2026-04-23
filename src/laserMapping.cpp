@@ -143,10 +143,20 @@ geometry_msgs::msg::PoseStamped msg_body_pose;
 shared_ptr<Preprocess> p_pre(new Preprocess());
 shared_ptr<ImuProcess> p_imu(new ImuProcess());
 
+// Forward declarations for use in SigHandle
+extern PointCloudXYZI::Ptr pcl_wait_pub;
+void save_to_pcd();
+
 void SigHandle(int sig)
 {
     flg_exit = true;
     std::cout << "catch sig %d" << sig << std::endl;
+    if (pcd_save_en && !map_file_path.empty() && pcl_wait_pub->size() > 0)
+    {
+        std::cout << "[FAST-LIO] Saving map to " << map_file_path << " (" << pcl_wait_pub->size() << " pts)..." << std::endl;
+        save_to_pcd();
+        std::cout << "[FAST-LIO] Map saved." << std::endl;
+    }
     sig_buffer.notify_all();
     rclcpp::shutdown();
 }
