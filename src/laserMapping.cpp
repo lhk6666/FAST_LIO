@@ -290,7 +290,7 @@ void lasermap_fov_segment()
     kdtree_delete_time = omp_get_wtime() - delete_begin;
 }
 
-void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::UniquePtr msg) 
+void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::ConstSharedPtr msg)
 {
     mtx_buffer.lock();
     scan_count ++;
@@ -318,7 +318,7 @@ void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::UniquePtr msg)
 
 double timediff_lidar_wrt_imu = 0.0;
 bool   timediff_set_flg = false;
-void livox_pcl_cbk(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg) 
+void livox_pcl_cbk(const livox_ros_driver2::msg::CustomMsg::ConstSharedPtr msg)
 {
     mtx_buffer.lock();
     double cur_time = get_time_sec(msg->header.stamp);
@@ -357,10 +357,11 @@ void livox_pcl_cbk(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg)
     sig_buffer.notify_all();
 }
 
-void imu_cbk(const sensor_msgs::msg::Imu::UniquePtr msg_in)
+void imu_cbk(const sensor_msgs::msg::Imu::ConstSharedPtr msg_in)
 {
     publish_count ++;
     // cout<<"IMU got at: "<<msg_in->header.stamp.toSec()<<endl;
+    // Make a mutable copy since the downstream pipeline rewrites header.stamp.
     sensor_msgs::msg::Imu::SharedPtr msg(new sensor_msgs::msg::Imu(*msg_in));
     
 
@@ -928,6 +929,12 @@ public:
             cout << "~~~~"<<ROOT_DIR<<" doesn't exist" << endl;
 
         /*** ROS subscribe initialization ***/
+        // NOTE: callbacks take ``ConstSharedPtr`` (not ``UniquePtr``).
+        // Newer Humble rclcpp headers have a bug in the UniquePtr intra-process
+        // template path (AnySubscriptionCallback's callback_variant_ becomes
+        // "invalid" inside SubscriptionIntraProcess::execute_impl). The
+        // SharedPtr callback shape matches fastlio2/lio_node.cpp's working
+        // style and avoids that template instantiation entirely.
         if (p_pre->lidar_type == AVIA)
         {
             sub_pcl_livox_ = this->create_subscription<livox_ros_driver2::msg::CustomMsg>(lid_topic, 20, livox_pcl_cbk);

@@ -140,8 +140,10 @@ class Preprocess
   Preprocess();
   ~Preprocess();
   
-  void process(const livox_ros_driver2::msg::CustomMsg::UniquePtr &msg, PointCloudXYZI::Ptr &pcl_out);
-  void process(const sensor_msgs::msg::PointCloud2::UniquePtr &msg, PointCloudXYZI::Ptr &pcl_out);
+  // Signatures updated from UniquePtr → ConstSharedPtr to match updated
+  // laserMapping.cpp callbacks (bypasses a rclcpp intra-process template bug).
+  void process(const livox_ros_driver2::msg::CustomMsg::ConstSharedPtr &msg, PointCloudXYZI::Ptr &pcl_out);
+  void process(const sensor_msgs::msg::PointCloud2::ConstSharedPtr &msg, PointCloudXYZI::Ptr &pcl_out);
   void set(bool feat_en, int lid_type, double bld, int pfilt_num);
 
   // sensor_msgs::PointCloud2::ConstPtr pointcloud;
@@ -155,11 +157,11 @@ class Preprocess
   // ros::Publisher pub_full, pub_surf, pub_corn;
 
 private:
-  void avia_handler(const livox_ros_driver2::msg::CustomMsg::UniquePtr &msg);
-  void oust64_handler(const sensor_msgs::msg::PointCloud2::UniquePtr &msg);
-  void velodyne_handler(const sensor_msgs::msg::PointCloud2::UniquePtr &msg);
-  void mid360_handler(const sensor_msgs::msg::PointCloud2::UniquePtr &msg);
-  void default_handler(const sensor_msgs::msg::PointCloud2::UniquePtr &msg);
+  void avia_handler(const livox_ros_driver2::msg::CustomMsg::ConstSharedPtr &msg);
+  void oust64_handler(const sensor_msgs::msg::PointCloud2::ConstSharedPtr &msg);
+  void velodyne_handler(const sensor_msgs::msg::PointCloud2::ConstSharedPtr &msg);
+  void mid360_handler(const sensor_msgs::msg::PointCloud2::ConstSharedPtr &msg);
+  void default_handler(const sensor_msgs::msg::PointCloud2::ConstSharedPtr &msg);
   void give_feature(PointCloudXYZI &pl, vector<orgtype> &types);
   void pub_func(PointCloudXYZI &pl, const rclcpp::Time &ct);
   int  plane_judge(const PointCloudXYZI &pl, vector<orgtype> &types, uint i, uint &i_nex, Eigen::Vector3d &curr_direct);
